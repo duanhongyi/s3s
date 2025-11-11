@@ -57,15 +57,24 @@ impl Range {
     /// Returns an error if the header is invalid
     pub fn parse(header: &str) -> Result<Self, ParseRangeError> {
         let err = || ParseRangeError { _priv: () };
-        let s = header.strip_prefix("bytes=").ok_or_else(err)?.as_bytes();
+        
+        // Support both Range header format: bytes=0-99 and Content-Range format: bytes 0-99/200
+        let s = if let Some(s) = header.strip_prefix("bytes=") {
+            s.as_bytes()
+        } else if let Some(s) = header.strip_prefix("bytes ") {
+            // Docker registry uses Content-Range format with space
+            s.as_bytes()
+        } else {
+            return Err(err());
+        };
 
         if let [b'-', s @ ..] = s {
-            // suffix range
-            let length = parse_u64_full(s).ok_or_else(err)?;
+            // suffix range: "-500" or "-500/1000" (ignore "/1000" part)
+            let (length, _) = parse_u64_once(s).ok_or_else(err)?;
             return Ok(Range::Suffix { length });
         }
 
-        // int range
+        // int range: "0-99" or "0-99/200" (ignore "/200" part)
         let (first, s) = parse_u64_once(s).ok_or_else(err)?;
         if first > (i64::MAX as u64) {
             return Err(err());
@@ -74,12 +83,12 @@ impl Range {
         let [b'-', s @ ..] = s else { return Err(err()) };
 
         if s.is_empty() {
-            // int range from
+            // int range from: "500-"
             return Ok(Range::Int { first, last: None });
         }
 
-        // int range inclusive
-        let last = parse_u64_full(s).ok_or_else(err)?;
+        // int range inclusive: "0-99" or "0-99/200" (parse "99", ignore "/200")
+        let (last, _) = parse_u64_once(s).ok_or_else(err)?;
         if last > (i64::MAX as u64) {
             return Err(err());
         }
@@ -156,12 +165,7 @@ impl http::TryFromHeaderValue for Range {
     }
 }
 
-fn parse_u64_full(s: &[u8]) -> Option<u64> {
-    match u64::from_radix_10_checked(s) {
-        (Some(x), pos) if pos == s.len() => Some(x),
-        _ => None,
-    }
-}
+
 
 fn parse_u64_once(s: &[u8]) -> Option<(u64, &[u8])> {
     match u64::from_radix_10_checked(s) {
@@ -234,6 +238,36 @@ mod tests {
             match expected {
                 Ok(expected) => assert_eq!(output.unwrap(), *expected),
                 Err(()) => assert!(output.is_err(), "{full_length:?}, {range:?}"),
+            }
+        }
+    }
+    
+    #[test]
+    fn docker_registry_content_range_format() {
+        // Docker registry uses Content-Range format during blob uploads
+        let cases = [
+            // Format: "bytes <START>-<END>/<TOTAL>" (space instead of equals)
+            ("bytes 0-99/200", Ok(range_int_inclusive(0, 99))),
+            ("bytes 0-9999/65345678", Ok(range_int_inclusive(0, 9999))),
+            ("bytes 10000-19999/65345678", Ok(range_int_inclusive(10000, 19999))),
+            ("bytes 65000000-65345677/65345678", Ok(range_int_inclusive(65000000, 65345677))),
+            
+            // Docker may not include total size in final chunk
+            ("bytes 65000000-65345677", Ok(range_int_inclusive(65000000, 65345677))),
+            
+            // Range without end (unknown total)
+            ("bytes 0-9999/", Ok(range_int_inclusive(0, 9999))),
+            
+            // Suffix range format in Content-Range style
+            ("bytes -500/2000", Ok(range_suffix(500))),
+            ("bytes -500", Ok(range_suffix(500))),
+        ];
+
+        for (input, expected) in &cases {
+            let output = Range::parse(input);
+            match expected {
+                Ok(expected) => assert_eq!(output.unwrap(), *expected, "Failed to parse Docker Content-Range: {}", input),
+                Err(()) => assert!(output.is_err(), "Should have failed to parse: {}", input),
             }
         }
     }
